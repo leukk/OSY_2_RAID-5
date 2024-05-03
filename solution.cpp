@@ -64,17 +64,30 @@ constexpr int TIMESTAMP_INDEX = 1;
 
 class CRaidVolume {
 public:
+    CRaidVolume();
+
+    ~CRaidVolume();
+
     /// Initializes TBlkDev drives with metadata
     /// @param dev TBlkDev interface
     /// @return False if failed, true if succeeded
     static bool create(const TBlkDev &dev);
 
+    /// 
+    /// @param dev 
+    /// @return 
     int start(const TBlkDev &dev);
 
+    /// 
+    /// @return 
     int stop();
 
+    /// Resynchronizes drives in case of RAID_DEGRADED
+    /// @return int, RAID status
     int resync();
 
+    /// Returns current RAID status
+    /// @return int, RAID status
     int status() const;
 
     /// Returns size of usable raid sectors
@@ -96,16 +109,21 @@ public:
     bool write(int secNr, const void *data, int secCnt);
 
 protected:
-
     /// Checks tblkdev validity
     /// @param dev tblkdev instance
     /// @return bool, validity of dev
     static bool checkTBlkDev(const TBlkDev &dev);
 
+    /// Calculate physical drive, sector and parity drive indices based on a raid sector index
+    /// @param raid_sector input raid sector index
+    /// @param drive_i output drive index
+    /// @param drive_sector_i output drive sector index
+    /// @param parity_drive_i output parity drive index
     void raidSectorToPhysical(int raid_sector, int &drive_i, int &drive_sector_i, int &parity_drive_i) const;
 
+    /// Clears & resets all member variables to default
+    /// (frees m_dev ptr)
     void clearRaidVolumeData();
-
 
     // Tblkdev interface ptr
     TBlkDev *m_dev = nullptr;
@@ -120,6 +138,14 @@ protected:
     INT_SECTOR_BUFFER(m_buffer);
 };
 
+CRaidVolume::CRaidVolume() {
+    clearRaidVolumeData();
+}
+
+CRaidVolume::~CRaidVolume() {
+    clearRaidVolumeData();
+}
+
 bool CRaidVolume::create(const TBlkDev &dev) {
     if (!checkTBlkDev(dev))
         return false;
@@ -131,19 +157,25 @@ bool CRaidVolume::create(const TBlkDev &dev) {
     // Create stack int buffer
     INT_SECTOR_BUFFER(buffer);
 
-    // Copy initial drive metadata to sector buffer
-    const CDriveMetadata initial_metadata(-1, 1);
-    memcpy(&buffer, &initial_metadata, sizeof(initial_metadata));
+    buffer[TIMESTAMP_INDEX] = 0;
+    buffer[FAILED_DRIVE_INDEX] = -1;
 
     // Try write default metadata to all drives
-    int fail_count = 0;
     const int metadata_sector_i = dev.m_Sectors - 1;
     for (int dev_i = 0; dev_i < dev.m_Devices; dev_i++) {
-        if (dev.m_Write(dev_i, metadata_sector_i, &buffer, 1) != 1)
-            fail_count++;
+        if (dev.m_Write(dev_i, metadata_sector_i, &buffer, 1) == 1)
+            continue;
+
+        // Initializing more than 2 drives failed
+        if(buffer[FAILED_DRIVE_INDEX] != -1)
+            return false;
+
+        // Initializing one drive failed, RAID DEGRADED, rewrite starting info
+        buffer[FAILED_DRIVE_INDEX] = dev_i;
+        dev_i = 0;
     }
 
-    return !fail_count;
+    return true;
 }
 
 int CRaidVolume::start(const TBlkDev &dev) {
@@ -347,7 +379,7 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
 bool CRaidVolume::checkTBlkDev(const TBlkDev &dev) {
     if (dev.m_Devices < 3 || dev.m_Devices > MAX_RAID_DEVICES)
         return false;
-    if (dev.m_Sectors < 1)
+    if (dev.m_Sectors < MIN_DEVICE_SECTORS || dev.m_Sectors > MAX_DEVICE_SECTORS)
         return false;
     if (!dev.m_Read)
         return false;
@@ -356,11 +388,6 @@ bool CRaidVolume::checkTBlkDev(const TBlkDev &dev) {
     return true;
 }
 
-/// Calculate physical drive, sector and parity drive indices based on a raid sector index
-/// @param raid_sector input raid sector index
-/// @param drive_i output drive index
-/// @param drive_sector_i output drive sector index
-/// @param parity_drive_i output parity drive index
 void CRaidVolume::raidSectorToPhysical(const int raid_sector, int &drive_i, int &drive_sector_i,
                                        int &parity_drive_i) const {
     const int mod = m_dev->m_Devices;
