@@ -172,6 +172,7 @@ int CRaidVolume::start(const TBlkDev &dev) {
     // Only read metadata from the first drive for now
     if (m_dev->m_Read(0, m_metadata_sector, &m_buffer, 1) != 1)
         return RAID_FAILED;
+
     m_metadata.m_failed_drive_i = -1;
     m_metadata.m_timestamp = m_buffer[1];
 
@@ -239,7 +240,7 @@ int CRaidVolume::size() const {
 
 bool CRaidVolume::read(int secNr, void *data, int secCnt) {
     // Read buffer nullptr or Invalid starting raid sector
-    if (!data || secCnt < 0 || secCnt > (m_raid_size - 1))
+    if (!data || secCnt < 0 || secCnt > (m_raid_size - 1) || m_status == RAID_FAILED)
         return false;
 
     for (int i = secNr; i < (secNr + secCnt); i++) {
@@ -253,9 +254,35 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
         int parity_drive_i = 0;
         raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
 
-        // Return false if reading from drive fails
-        if (m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1)
-            return false;
+        // Try read data from "FAIL" drive - use parity
+        // TODO: Use parity instead of faulty drive
+        if(m_status == RAID_DEGRADED && m_metadata.m_failed_drive_i == drive_i) {
+            if (m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1) {
+                // Reading parity failed, 2+ drives failed, raid failed
+                m_status = RAID_FAILED;
+                return false;
+            }
+        }
+
+        // Try read data from "OK" drive in degraded state
+        if(m_status == RAID_DEGRADED && m_metadata.m_failed_drive_i != drive_i) {
+            if (m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1) {
+                // Current drive failed in addition to other degraded drive
+                m_status = RAID_FAILED;
+                return false;
+            }
+        }
+
+        // RAID must be RAID_OK, read
+        if (m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1) {
+            // Current drive failed, set raid to degraded state
+            m_status = RAID_DEGRADED;
+            m_metadata.m_failed_drive_i = drive_i;
+
+            // Repeat read in degraded state
+            i--;
+            continue;
+        }
 
         // Increment buffer pointer
         data += SECTOR_SIZE;
@@ -266,7 +293,7 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
 
 bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
     // Write buffer nullptr or Invalid starting raid sector
-    if (!data || secCnt < 0 || secCnt > (m_raid_size - 1))
+    if (!data || secCnt < 0 || secCnt > (m_raid_size - 1) || m_status == RAID_FAILED)
         return false;
 
     for (int i = secNr; i < (secNr + secCnt); i++) {
@@ -280,9 +307,35 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
         int parity_drive_i = 0;
         raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
 
-        // Return false if writing to drive fails
-        if (m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1)
-            return false;
+        // Try write data from "FAIL" drive - use parity
+        // TODO: Use parity instead of faulty drive
+        if(m_status == RAID_DEGRADED && m_metadata.m_failed_drive_i == drive_i) {
+            if (m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1) {
+                // Writing parity failed, 2+ drives failed, raid failed
+                m_status = RAID_FAILED;
+                return false;
+            }
+        }
+
+        // Try read data from "OK" drive in degraded state
+        if(m_status == RAID_DEGRADED && m_metadata.m_failed_drive_i != drive_i) {
+            if (m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1) {
+                // Current drive failed in addition to other degraded drive
+                m_status = RAID_FAILED;
+                return false;
+            }
+        }
+
+        // RAID must be RAID_OK, write
+        if (m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1) {
+            // Current drive failed, set raid to degraded state
+            m_status = RAID_DEGRADED;
+            m_metadata.m_failed_drive_i = drive_i;
+
+            // Repeat write in degraded state
+            i--;
+            continue;
+        }
 
         // Increment buffer pointer
         data += SECTOR_SIZE;
