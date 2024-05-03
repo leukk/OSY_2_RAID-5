@@ -56,6 +56,14 @@ struct CDriveMetadata {
     int m_timestamp = 1;
 };
 
+union UBuffer {
+    char char_buffer[SECTOR_SIZE];
+    int int_buffer[SECTOR_SIZE / sizeof(int)];
+};
+
+constexpr int FAILED_DRIVE_INT_BUFFER_INDEX = 0;
+constexpr int TIMESTAMP_INT_BUFFER_INDEX = 1;
+
 class CRaidVolume {
 public:
     /// Initializes TBlkDev drives with metadata
@@ -96,30 +104,35 @@ public:
 
     void raidSectorToPhysical(int raid_sector, int & drive_i, int & drive_sector_i, int & parity_drive_i) const;
 
+    void clearRaidVolumeData();
+
 protected:
     // Tblkdev interface ptr
     TBlkDev * m_dev = nullptr;
     // Metadata sector index & metadata ptr
     int m_metadata_sector = 0;
-    CDriveMetadata * m_drives_metadata = nullptr;
+    CDriveMetadata m_metadata = {};
     // Current RAID status
     int m_status = RAID_STOPPED;
     // Current RAID size
     int m_raid_size = 0;
+    // R/W buffer of SECTOR_SIZE
+    UBuffer m_buffer = {};
 };
 
 bool CRaidVolume::create(const TBlkDev &dev) {
     if(!checkTBlkDev(dev))
         return false;
 
-    if (SECTOR_SIZE < sizeof(CDriveMetadata))
+    // Check if sector_size is too small for metadata
+    if constexpr (SECTOR_SIZE < sizeof(CDriveMetadata))
         return false;
 
-    // Create write buffer
-    char write_buffer[SECTOR_SIZE] = {};
+    // Use m_buffer as int buffer
+    int write_buffer[SECTOR_SIZE/sizeof(int)] = {};
 
     // Copy initial drive metadata to sector buffer
-    const CDriveMetadata initial_metadata(DRIVE_OK, 1);
+    const CDriveMetadata initial_metadata(-1, 1);
     memcpy(&write_buffer, &initial_metadata, sizeof(initial_metadata));
 
     // Try write default metadata to all drives
@@ -135,7 +148,7 @@ bool CRaidVolume::create(const TBlkDev &dev) {
 
 int CRaidVolume::start(const TBlkDev &dev) {
     // RAID volume was not stopped before calling start
-    if(m_dev != nullptr || m_drives_metadata != nullptr)
+    if(m_dev != nullptr || !checkTBlkDev(dev))
         return RAID_FAILED;
 
     // Initialize RAID, Copy TBlkDev
@@ -147,47 +160,73 @@ int CRaidVolume::start(const TBlkDev &dev) {
 
     // Assume RAID_OK before checking metadata
     m_status = RAID_OK;
+
     // Calculate raid size
     const int usable_sector_count = (m_dev->m_Devices * m_dev->m_Sectors) - m_dev->m_Devices;
     m_raid_size = usable_sector_count - (usable_sector_count / dev.m_Devices);
 
     // Initialize metadata sector & m_drives_metadata array
     m_metadata_sector = m_dev->m_Sectors - 1;
-    m_drives_metadata = new CDriveMetadata[m_dev->m_Devices];
+    // auto m_drives_metadata = new CDriveMetadata[m_dev->m_Devices];
 
-    // Create metadata read buffer
-    int read_buffer[SECTOR_SIZE/sizeof(int)] = {};
+    // Use m_buffer as int buffer
+    int * read_buffer = m_buffer.int_buffer;
 
-    int majority_timestamp = -1;
-    int faulty_drive = -1;
+    // Only read metadata from the first drive for now
+    if (m_dev->m_Read(0, m_metadata_sector, &read_buffer, 1) != 1)
+        return RAID_FAILED;
+    m_metadata.m_failed_drive_i = -1;
+    m_metadata.m_timestamp = read_buffer[1];
 
-    // Read metadata of every drive to metadata array
-    for(int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
-        if (m_dev->m_Read(dev_i, m_metadata_sector, &read_buffer, 1) != 1) {
-            m_drives_metadata[dev_i].m_failed_drive_i = 0;
-            m_drives_metadata[dev_i].m_timestamp = 0;
-        } else {
-            m_drives_metadata[dev_i].m_failed_drive_i = read_buffer[0];
-            m_drives_metadata[dev_i].m_timestamp = read_buffer[1];
-        }
-
-        // Skip RAID status initialization until 3rd drive
-        if (dev_i < 2)
-            continue;
-
-        auto current = m_drives_metadata[dev_i];
-        auto one_prev = m_drives_metadata[dev_i-1];
-        auto two_prev = m_drives_metadata[dev_i-2];
-
-        if(current.m_timestamp == one_prev.m_timestamp && one_prev.m_timestamp == two_prev.m_timestamp)
-            continue;
-    }
+    // // Read metadata of every drive to metadata array
+    // for(int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
+    //     if (m_dev->m_Read(dev_i, m_metadata_sector, &read_buffer, 1) != 1) {
+    //         m_drives_metadata[dev_i].m_failed_drive_i = 0;
+    //         m_drives_metadata[dev_i].m_timestamp = 0;
+    //     } else {
+    //         m_drives_metadata[dev_i].m_failed_drive_i = read_buffer[0];
+    //         m_drives_metadata[dev_i].m_timestamp = read_buffer[1];
+    //     }
+    //
+    //     // Skip RAID status initialization until 3rd drive
+    //     if (dev_i < 2)
+    //         continue;
+    //
+    //     auto current = m_drives_metadata[dev_i];
+    //     auto one_prev = m_drives_metadata[dev_i-1];
+    //     auto two_prev = m_drives_metadata[dev_i-2];
+    //
+    //     if(current.m_timestamp == one_prev.m_timestamp && one_prev.m_timestamp == two_prev.m_timestamp)
+    //         continue;
+    // }
+    //
+    // delete [] m_drives_metadata;
 
     return m_status;
 }
 
 int CRaidVolume::stop() {
-    return 0;
+    // Increment current metadata timestamp
+    m_metadata.m_timestamp += 1;
+
+    // Use m_buffer as int buffer
+    int * write_buffer = m_buffer.int_buffer;
+    write_buffer[FAILED_DRIVE_INT_BUFFER_INDEX] = m_metadata.m_failed_drive_i;
+    write_buffer[TIMESTAMP_INT_BUFFER_INDEX] = m_metadata.m_timestamp;
+
+    // Write metadata information to all drives, no need to check write success
+    for(int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
+        m_dev->m_Write(dev_i, m_metadata_sector, &write_buffer, 1);
+    }
+
+    // Clear CRaidVolume data
+    // I dont understand why one instance needs to be able to handle
+    // multiple "physical" RAID volumes. This forces the start / stop
+    // functions to behave like a constructor/desctructor which is very
+    // confusing.
+    clearRaidVolumeData();
+
+    return m_status;
 }
 
 int CRaidVolume::resync() {
@@ -203,11 +242,57 @@ int CRaidVolume::size() const {
 }
 
 bool CRaidVolume::read(int secNr, void *data, int secCnt) {
-    return false;
+    // Read buffer nullptr or Invalid starting raid sector
+    if(!data || secCnt < 0 || secCnt > (m_raid_size - 1))
+        return false;
+
+    for (int i = secNr; i < (secNr + secCnt); i++) {
+        // Reading past existing raid sectors
+        if (i >= m_raid_size)
+            return false;
+
+        // Translate raid index to "physical" drive/sector/parity_drive indices
+        int drive_i = 0;
+        int drive_sector_i = 0;
+        int parity_drive_i = 0;
+        raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
+
+        // Return false if reading from drive fails
+        if(m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1)
+            return false;
+
+        // Increment buffer pointer
+        data += SECTOR_SIZE;
+    }
+
+    return true;
 }
 
 bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
-    return false;
+    // Write buffer nullptr or Invalid starting raid sector
+    if(!data || secCnt < 0 || secCnt > (m_raid_size - 1))
+        return false;
+
+    for (int i = secNr; i < (secNr + secCnt); i++) {
+        // Writing past existing raid sectors
+        if (i >= m_raid_size)
+            return false;
+
+        // Translate raid index to "physical" drive/sector/parity_drive indices
+        int drive_i = 0;
+        int drive_sector_i = 0;
+        int parity_drive_i = 0;
+        raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
+
+        // Return false if writing to drive fails
+        if(m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1)
+            return false;
+
+        // Increment buffer pointer
+        data += SECTOR_SIZE;
+    }
+
+    return true;
 }
 
 bool CRaidVolume::checkTBlkDev(const TBlkDev& dev) {
@@ -236,6 +321,18 @@ void CRaidVolume::raidSectorToPhysical(const int raid_sector, int &drive_i, int 
     drive_i = phys_sector % mod;
     drive_sector_i = phys_sector / mod;
     parity_drive_i = (phys_sector / mod) % mod;
+}
+
+void CRaidVolume::clearRaidVolumeData() {
+    // Free & reset heap variables
+    delete m_dev;
+    m_dev = nullptr;
+
+    // Reset stack variables
+    m_metadata_sector = 0;
+    m_metadata = {};
+    m_status = RAID_STOPPED;
+    m_raid_size = 0;
 }
 
 #ifndef __PROGTEST__
