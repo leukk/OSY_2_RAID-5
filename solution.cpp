@@ -55,17 +55,12 @@ struct CDriveMetadata {
     int m_timestamp = 1;
 };
 
-union UBuffer {
-    char char_buffer[SECTOR_SIZE];
-    int int_buffer[SECTOR_SIZE / sizeof(int)];
-};
+constexpr int FAILED_DRIVE_INDEX = 0;
+constexpr int TIMESTAMP_INDEX = 1;
 
-constexpr int FAILED_DRIVE_INT_BUFFER_INDEX = 0;
-constexpr int TIMESTAMP_INT_BUFFER_INDEX = 1;
-
-#define INT_SECTOR_BUFFER int buffer[SECTOR_SIZE/sizeof(int)] = {};
-#define CHAR_SECTOR_BUFFER int buffer[SECTOR_SIZE/sizeof(int)] = {};
-
+// Stack allocated buffer macros
+#define INT_SECTOR_BUFFER(NAME) int NAME[SECTOR_SIZE/sizeof(int)] = {}
+#define CHAR_SECTOR_BUFFER(NAME) char NAME[SECTOR_SIZE] = {}
 
 class CRaidVolume {
 public:
@@ -121,8 +116,8 @@ protected:
     int m_status = RAID_STOPPED;
     // Current RAID size
     int m_raid_size = 0;
-    // R/W buffer of SECTOR_SIZE
-    UBuffer m_buffer = {};
+    // Member R/W buffer
+    INT_SECTOR_BUFFER(m_buffer);
 };
 
 bool CRaidVolume::create(const TBlkDev &dev) {
@@ -133,18 +128,18 @@ bool CRaidVolume::create(const TBlkDev &dev) {
     if constexpr (SECTOR_SIZE < sizeof(CDriveMetadata))
         return false;
 
-    // Use m_buffer as int buffer
-    int write_buffer[SECTOR_SIZE / sizeof(int)] = {};
+    // Create stack int buffer
+    INT_SECTOR_BUFFER(buffer);
 
     // Copy initial drive metadata to sector buffer
     const CDriveMetadata initial_metadata(-1, 1);
-    memcpy(&write_buffer, &initial_metadata, sizeof(initial_metadata));
+    memcpy(&buffer, &initial_metadata, sizeof(initial_metadata));
 
     // Try write default metadata to all drives
     int fail_count = 0;
     const int metadata_sector_i = dev.m_Sectors - 1;
     for (int dev_i = 0; dev_i < dev.m_Devices; dev_i++) {
-        if (dev.m_Write(dev_i, metadata_sector_i, &write_buffer, 1) != 1)
+        if (dev.m_Write(dev_i, metadata_sector_i, &buffer, 1) != 1)
             fail_count++;
     }
 
@@ -174,14 +169,11 @@ int CRaidVolume::start(const TBlkDev &dev) {
     m_metadata_sector = m_dev->m_Sectors - 1;
     // auto m_drives_metadata = new CDriveMetadata[m_dev->m_Devices];
 
-    // Use m_buffer as int buffer
-    int *read_buffer = m_buffer.int_buffer;
-
     // Only read metadata from the first drive for now
-    if (m_dev->m_Read(0, m_metadata_sector, &read_buffer, 1) != 1)
+    if (m_dev->m_Read(0, m_metadata_sector, &m_buffer, 1) != 1)
         return RAID_FAILED;
     m_metadata.m_failed_drive_i = -1;
-    m_metadata.m_timestamp = read_buffer[1];
+    m_metadata.m_timestamp = m_buffer[1];
 
     // // Read metadata of every drive to metadata array
     // for(int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
@@ -214,14 +206,13 @@ int CRaidVolume::stop() {
     // Increment current metadata timestamp
     m_metadata.m_timestamp += 1;
 
-    // Use m_buffer as int buffer
-    int *write_buffer = m_buffer.int_buffer;
-    write_buffer[FAILED_DRIVE_INT_BUFFER_INDEX] = m_metadata.m_failed_drive_i;
-    write_buffer[TIMESTAMP_INT_BUFFER_INDEX] = m_metadata.m_timestamp;
+    // Load metadata to m_buffer
+    m_buffer[FAILED_DRIVE_INDEX] = m_metadata.m_failed_drive_i;
+    m_buffer[TIMESTAMP_INDEX] = m_metadata.m_timestamp;
 
     // Write metadata information to all drives, no need to check write success
     for (int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
-        m_dev->m_Write(dev_i, m_metadata_sector, &write_buffer, 1);
+        m_dev->m_Write(dev_i, m_metadata_sector, &m_buffer, 1);
     }
 
     // Clear CRaidVolume data
@@ -301,7 +292,7 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
 }
 
 bool CRaidVolume::checkTBlkDev(const TBlkDev &dev) {
-    if (dev.m_Devices < 3)
+    if (dev.m_Devices < 3 || dev.m_Devices > MAX_RAID_DEVICES)
         return false;
     if (dev.m_Sectors < 1)
         return false;
