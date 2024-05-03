@@ -1,6 +1,4 @@
-#include <vector>
 #ifndef __PROGTEST__
-
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -8,7 +6,6 @@
 #include <cstdint>
 #include <cassert>
 #include <stdexcept>
-
 using namespace std;
 
 
@@ -40,17 +37,19 @@ struct TBlkDev {
     int m_Devices; // Number of used drives
     int m_Sectors; // Number of sectors per drive
 
-    int (*m_Read )(int, int, void *, int); // Read function ptr
+    int (*m_Read)(int, int, void *, int); // Read function ptr
 
-    int (*m_Write )(int, int, const void *, int); // Write function ptr
+    int (*m_Write)(int, int, const void *, int); // Write function ptr
 };
 
 #endif /* __PROGTEST__ */
 
 struct CDriveMetadata {
     CDriveMetadata() = default;
+
     explicit CDriveMetadata(const int failed_drive_index, const int timestamp)
-        : m_failed_drive_i(failed_drive_index), m_timestamp(timestamp) {};
+        : m_failed_drive_i(failed_drive_index), m_timestamp(timestamp) {
+    };
 
     int m_failed_drive_i = -1;
     int m_timestamp = 1;
@@ -63,6 +62,10 @@ union UBuffer {
 
 constexpr int FAILED_DRIVE_INT_BUFFER_INDEX = 0;
 constexpr int TIMESTAMP_INT_BUFFER_INDEX = 1;
+
+#define INT_SECTOR_BUFFER int buffer[SECTOR_SIZE/sizeof(int)] = {};
+#define CHAR_SECTOR_BUFFER int buffer[SECTOR_SIZE/sizeof(int)] = {};
+
 
 class CRaidVolume {
 public:
@@ -97,18 +100,20 @@ public:
     /// \return bool, operation success
     bool write(int secNr, const void *data, int secCnt);
 
+protected:
+
     /// Checks tblkdev validity
     /// @param dev tblkdev instance
     /// @return bool, validity of dev
-    static bool checkTBlkDev(const TBlkDev& dev);
+    static bool checkTBlkDev(const TBlkDev &dev);
 
-    void raidSectorToPhysical(int raid_sector, int & drive_i, int & drive_sector_i, int & parity_drive_i) const;
+    void raidSectorToPhysical(int raid_sector, int &drive_i, int &drive_sector_i, int &parity_drive_i) const;
 
     void clearRaidVolumeData();
 
-protected:
+
     // Tblkdev interface ptr
-    TBlkDev * m_dev = nullptr;
+    TBlkDev *m_dev = nullptr;
     // Metadata sector index & metadata ptr
     int m_metadata_sector = 0;
     CDriveMetadata m_metadata = {};
@@ -121,7 +126,7 @@ protected:
 };
 
 bool CRaidVolume::create(const TBlkDev &dev) {
-    if(!checkTBlkDev(dev))
+    if (!checkTBlkDev(dev))
         return false;
 
     // Check if sector_size is too small for metadata
@@ -129,7 +134,7 @@ bool CRaidVolume::create(const TBlkDev &dev) {
         return false;
 
     // Use m_buffer as int buffer
-    int write_buffer[SECTOR_SIZE/sizeof(int)] = {};
+    int write_buffer[SECTOR_SIZE / sizeof(int)] = {};
 
     // Copy initial drive metadata to sector buffer
     const CDriveMetadata initial_metadata(-1, 1);
@@ -138,7 +143,7 @@ bool CRaidVolume::create(const TBlkDev &dev) {
     // Try write default metadata to all drives
     int fail_count = 0;
     const int metadata_sector_i = dev.m_Sectors - 1;
-    for(int dev_i = 0; dev_i < dev.m_Devices; dev_i++) {
+    for (int dev_i = 0; dev_i < dev.m_Devices; dev_i++) {
         if (dev.m_Write(dev_i, metadata_sector_i, &write_buffer, 1) != 1)
             fail_count++;
     }
@@ -148,7 +153,7 @@ bool CRaidVolume::create(const TBlkDev &dev) {
 
 int CRaidVolume::start(const TBlkDev &dev) {
     // RAID volume was not stopped before calling start
-    if(m_dev != nullptr || !checkTBlkDev(dev))
+    if (m_dev != nullptr || !checkTBlkDev(dev))
         return RAID_FAILED;
 
     // Initialize RAID, Copy TBlkDev
@@ -170,7 +175,7 @@ int CRaidVolume::start(const TBlkDev &dev) {
     // auto m_drives_metadata = new CDriveMetadata[m_dev->m_Devices];
 
     // Use m_buffer as int buffer
-    int * read_buffer = m_buffer.int_buffer;
+    int *read_buffer = m_buffer.int_buffer;
 
     // Only read metadata from the first drive for now
     if (m_dev->m_Read(0, m_metadata_sector, &read_buffer, 1) != 1)
@@ -210,12 +215,12 @@ int CRaidVolume::stop() {
     m_metadata.m_timestamp += 1;
 
     // Use m_buffer as int buffer
-    int * write_buffer = m_buffer.int_buffer;
+    int *write_buffer = m_buffer.int_buffer;
     write_buffer[FAILED_DRIVE_INT_BUFFER_INDEX] = m_metadata.m_failed_drive_i;
     write_buffer[TIMESTAMP_INT_BUFFER_INDEX] = m_metadata.m_timestamp;
 
     // Write metadata information to all drives, no need to check write success
-    for(int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
+    for (int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
         m_dev->m_Write(dev_i, m_metadata_sector, &write_buffer, 1);
     }
 
@@ -243,7 +248,7 @@ int CRaidVolume::size() const {
 
 bool CRaidVolume::read(int secNr, void *data, int secCnt) {
     // Read buffer nullptr or Invalid starting raid sector
-    if(!data || secCnt < 0 || secCnt > (m_raid_size - 1))
+    if (!data || secCnt < 0 || secCnt > (m_raid_size - 1))
         return false;
 
     for (int i = secNr; i < (secNr + secCnt); i++) {
@@ -258,7 +263,7 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
         raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
 
         // Return false if reading from drive fails
-        if(m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1)
+        if (m_dev->m_Read(drive_i, drive_sector_i, data, 1) != 1)
             return false;
 
         // Increment buffer pointer
@@ -270,7 +275,7 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
 
 bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
     // Write buffer nullptr or Invalid starting raid sector
-    if(!data || secCnt < 0 || secCnt > (m_raid_size - 1))
+    if (!data || secCnt < 0 || secCnt > (m_raid_size - 1))
         return false;
 
     for (int i = secNr; i < (secNr + secCnt); i++) {
@@ -285,7 +290,7 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
         raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
 
         // Return false if writing to drive fails
-        if(m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1)
+        if (m_dev->m_Write(drive_i, drive_sector_i, data, 1) != 1)
             return false;
 
         // Increment buffer pointer
@@ -295,14 +300,14 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
     return true;
 }
 
-bool CRaidVolume::checkTBlkDev(const TBlkDev& dev) {
-    if(dev.m_Devices < 3)
+bool CRaidVolume::checkTBlkDev(const TBlkDev &dev) {
+    if (dev.m_Devices < 3)
         return false;
-    if(dev.m_Sectors < 1)
+    if (dev.m_Sectors < 1)
         return false;
-    if(!dev.m_Read)
+    if (!dev.m_Read)
         return false;
-    if(!dev.m_Write)
+    if (!dev.m_Write)
         return false;
     return true;
 }
@@ -312,10 +317,11 @@ bool CRaidVolume::checkTBlkDev(const TBlkDev& dev) {
 /// @param drive_i output drive index
 /// @param drive_sector_i output drive sector index
 /// @param parity_drive_i output parity drive index
-void CRaidVolume::raidSectorToPhysical(const int raid_sector, int &drive_i, int &drive_sector_i, int &parity_drive_i) const {
+void CRaidVolume::raidSectorToPhysical(const int raid_sector, int &drive_i, int &drive_sector_i,
+                                       int &parity_drive_i) const {
     const int mod = m_dev->m_Devices;
 
-    const int skipped_parities = 1 + (int)(raid_sector / mod);
+    const int skipped_parities = 1 + (int) (raid_sector / mod);
     const int phys_sector = raid_sector + skipped_parities;
 
     drive_i = phys_sector % mod;
