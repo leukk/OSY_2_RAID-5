@@ -31,7 +31,7 @@
 #define error(...)
 
 constexpr int RAID_DEVICES = 4;
-constexpr int DISK_SECTORS = 8;
+constexpr int DISK_SECTORS = 8192 * 2;
 static FILE * g_Fp[RAID_DEVICES];
 
 //-------------------------------------------------------------------------------------------------
@@ -755,7 +755,6 @@ void test1() {
 int main() {
     srand(time(nullptr));
     test0();
-    return EXIT_SUCCESS;
     test1();
     return EXIT_SUCCESS;
 }
