@@ -10,7 +10,7 @@ using namespace std;
 
 
 // Size of one sector in bytes, the basic unit for all operations
-constexpr int SECTOR_SIZE = 512;
+constexpr int SECTOR_SIZE = 8;
 // Maximum number of devices in RAID
 constexpr int MAX_RAID_DEVICES = 16;
 // Minimum number of devices in RAID
@@ -18,7 +18,8 @@ constexpr int MIN_RAID_DEVICES = 3;
 // Maximum number of sectors on one disk
 constexpr int MAX_DEVICE_SECTORS = 1024 * 1024 * 2;
 // Minimum number of sectors on one disk
-constexpr int MIN_DEVICE_SECTORS = 1 * 1024 * 2;
+// constexpr int MIN_DEVICE_SECTORS = 1 * 1024 * 2;
+constexpr int MIN_DEVICE_SECTORS = 6;
 
 constexpr int RAID_STOPPED = 0; // Not assembled (before calling start)
 constexpr int RAID_OK = 1; // Operating correctly
@@ -156,6 +157,7 @@ bool CRaidVolume::create(const TBlkDev &dev) {
 
     // Create stack int buffer
     INT_SECTOR_BUFFER(buffer);
+    memset(&buffer, 0, SECTOR_SIZE);
 
     buffer[TIMESTAMP_INDEX] = 0;
     buffer[FAILED_DRIVE_INDEX] = -1;
@@ -199,9 +201,9 @@ int CRaidVolume::start(const TBlkDev &dev) {
 
     // Initialize metadata sector & m_drives_metadata array
     m_metadata_sector = m_dev->m_Sectors - 1;
-    // auto m_drives_metadata = new CDriveMetadata[m_dev->m_Devices];
 
     // Only read metadata from the first drive for now
+    memset(&m_buffer, 0, SECTOR_SIZE);
     if (m_dev->m_Read(0, m_metadata_sector, &m_buffer, 1) != 1)
         return RAID_FAILED;
 
@@ -236,30 +238,50 @@ int CRaidVolume::start(const TBlkDev &dev) {
 }
 
 int CRaidVolume::stop() {
+    if(m_status == RAID_STOPPED || m_status == RAID_FAILED)
+        return m_status = RAID_STOPPED;
+
     // Increment current metadata timestamp
     m_metadata.m_timestamp += 1;
 
     // Load metadata to m_buffer
+    memset(&m_buffer, 0, SECTOR_SIZE);
     m_buffer[FAILED_DRIVE_INDEX] = m_metadata.m_failed_drive_i;
     m_buffer[TIMESTAMP_INDEX] = m_metadata.m_timestamp;
 
-    // Write metadata information to all drives, no need to check write success
+    // Write metadata information to all drives
     for (int dev_i = 0; dev_i < m_dev->m_Devices; dev_i++) {
-        m_dev->m_Write(dev_i, m_metadata_sector, &m_buffer, 1);
+        if(m_dev->m_Write(dev_i, m_metadata_sector, &m_buffer, 1) == 1)
+            continue;
+
+        // Skip trying to correct writing to a degraded drive or a failed RAID
+        if(m_metadata.m_failed_drive_i == dev_i)
+            continue;
+
+        // Raid degraded while stopping, rewrite buffer info
+        if(m_status == RAID_OK) {
+            m_metadata.m_failed_drive_i = dev_i;
+            m_status = RAID_DEGRADED;
+            m_buffer[FAILED_DRIVE_INDEX] = m_metadata.m_failed_drive_i;
+            dev_i = 0;
+            continue;
+        }
+
+        // RAID failed while stopping, rewrite metadata without chekcing
+        if(m_status == RAID_DEGRADED) {
+            m_status = RAID_FAILED;
+            dev_i = 0;
+        }
     }
 
     // Clear CRaidVolume data
-    // I dont understand why one instance needs to be able to handle
-    // multiple "physical" RAID volumes. This forces the start / stop
-    // functions to behave like a constructor/desctructor which is very
-    // confusing.
     clearRaidVolumeData();
 
     return m_status;
 }
 
 int CRaidVolume::resync() {
-    return 0;
+    return m_status;
 }
 
 int CRaidVolume::status() const {
@@ -275,16 +297,16 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
     if (!data || secCnt < 0 || secCnt > (m_raid_size - 1) || m_status == RAID_FAILED)
         return false;
 
-    for (int i = secNr; i < (secNr + secCnt); i++) {
+    for (int raid_i = secNr; raid_i < (secNr + secCnt); raid_i++) {
         // Reading past existing raid sectors
-        if (i >= m_raid_size)
+        if (raid_i >= m_raid_size)
             return false;
 
         // Translate raid index to "physical" drive/sector/parity_drive indices
         int drive_i = 0;
         int drive_sector_i = 0;
         int parity_drive_i = 0;
-        raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
+        raidSectorToPhysical(raid_i, drive_i, drive_sector_i, parity_drive_i);
 
         // Try read data from "FAIL" drive - use parity
         // TODO: Use parity instead of faulty drive
@@ -312,7 +334,7 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
             m_metadata.m_failed_drive_i = drive_i;
 
             // Repeat read in degraded state
-            i--;
+            raid_i--;
             continue;
         }
 
@@ -328,16 +350,16 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
     if (!data || secCnt < 0 || secCnt > (m_raid_size - 1) || m_status == RAID_FAILED)
         return false;
 
-    for (int i = secNr; i < (secNr + secCnt); i++) {
+    for (int raid_i = secNr; raid_i < (secNr + secCnt); raid_i++) {
         // Writing past existing raid sectors
-        if (i >= m_raid_size)
+        if (raid_i >= m_raid_size)
             return false;
 
         // Translate raid index to "physical" drive/sector/parity_drive indices
         int drive_i = 0;
         int drive_sector_i = 0;
         int parity_drive_i = 0;
-        raidSectorToPhysical(secCnt, drive_i, drive_sector_i, parity_drive_i);
+        raidSectorToPhysical(raid_i, drive_i, drive_sector_i, parity_drive_i);
 
         // Try write data from "FAIL" drive - use parity
         // TODO: Use parity instead of faulty drive
@@ -365,7 +387,7 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
             m_metadata.m_failed_drive_i = drive_i;
 
             // Repeat write in degraded state
-            i--;
+            raid_i--;
             continue;
         }
 
@@ -390,14 +412,18 @@ bool CRaidVolume::checkTBlkDev(const TBlkDev &dev) {
 
 void CRaidVolume::raidSectorToPhysical(const int raid_sector, int &drive_i, int &drive_sector_i,
                                        int &parity_drive_i) const {
-    const int mod = m_dev->m_Devices;
+    // const int mod = m_dev->m_Devices;
+    //
+    // const int skipped_parities = 1 + (int) (raid_sector / mod);
+    // const int phys_sector = raid_sector + skipped_parities;
+    //
+    // drive_i = phys_sector % mod;
+    // drive_sector_i = phys_sector / mod;
+    // parity_drive_i = (phys_sector / mod) % mod;
 
-    const int skipped_parities = 1 + (int) (raid_sector / mod);
-    const int phys_sector = raid_sector + skipped_parities;
-
-    drive_i = phys_sector % mod;
-    drive_sector_i = phys_sector / mod;
-    parity_drive_i = (phys_sector / mod) % mod;
+    drive_i = raid_sector / m_dev->m_Sectors;
+    drive_sector_i = raid_sector % m_dev->m_Sectors;
+    parity_drive_i = m_dev->m_Devices - 1;
 }
 
 void CRaidVolume::clearRaidVolumeData() {
@@ -414,6 +440,6 @@ void CRaidVolume::clearRaidVolumeData() {
 
 #ifndef __PROGTEST__
 
-#include "tests.inc"
+#include "custom.inc"
 
 #endif /* __PROGTEST__ */
