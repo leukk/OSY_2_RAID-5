@@ -10,7 +10,7 @@ using namespace std;
 
 
 // Size of one sector in bytes, the basic unit for all operations
-constexpr int SECTOR_SIZE = 512;
+constexpr int SECTOR_SIZE = 8;
 // Maximum number of devices in RAID
 constexpr int MAX_RAID_DEVICES = 16;
 // Minimum number of devices in RAID
@@ -130,9 +130,9 @@ protected:
     /// @param dead_drive_i in, index of faulty drive
     /// @param sector_i in, index of faulty drive sector
     /// @return bool, reading success
-    bool xor_read_without_dead_sector(INT_SECTOR_BUFFER(out_buffer), int dead_drive_i, int sector_i) const;
+    int xor_read_without_sector(INT_SECTOR_BUFFER(out_buffer), int dead_drive_i, int sector_i) const;
 
-    bool xor_get_parity_supplement_dead_sector(INT_SECTOR_BUFFER(out_buffer), int parity_drive_i,
+    int xor_get_parity_supplement_dead_sector(INT_SECTOR_BUFFER(out_buffer), int parity_drive_i,
                                                int dead_drive_i,
                                                const INT_SECTOR_BUFFER(dead_drive_supplement_buffer),
                                                int sector_i) const;
@@ -212,8 +212,8 @@ int CRaidVolume::start(const TBlkDev &dev) {
     // Assume RAID_OK before checking metadata
     m_status = RAID_OK;
     // Calculate raid size
-    const int usable_sector_count = (m_dev->m_Devices * m_dev->m_Sectors) - m_dev->m_Devices;
-    m_raid_size = usable_sector_count - (usable_sector_count / dev.m_Devices);
+    const int usable_sector_count = m_dev->m_Devices * (m_dev->m_Sectors - 1); // Number of non metadata sectors
+    m_raid_size = usable_sector_count - (m_dev->m_Sectors - 1); // Subtract parity sectors - aka one for each line
     // Initialize metadata sector & m_drives_metadata array
     m_metadata_sector = m_dev->m_Sectors - 1;
 
@@ -245,13 +245,13 @@ int CRaidVolume::start(const TBlkDev &dev) {
         auto other_b = (read_failed_drive + 2) % 3;
 
         // Timestamps of other two successfully read drives dont match
-        if(timestamps[other_a] != timestamps[other_b]) {
+        if (timestamps[other_a] != timestamps[other_b]) {
             m_status = RAID_FAILED;
             return m_status;
         }
 
         // There was no known failed drive when shutting down
-        if(failed_drives[other_a] < 0) {
+        if (failed_drives[other_a] < 0) {
             m_status = RAID_DEGRADED;
             m_metadata.m_failed_drive_i = read_failed_drive;
             m_metadata.m_timestamp = timestamps[other_a];
@@ -263,39 +263,35 @@ int CRaidVolume::start(const TBlkDev &dev) {
         return m_status;
     }
     if (read_failed_cnt == 0) {
-        if(timestamps[0] != timestamps[1] && timestamps[1] != timestamps[2] && timestamps[0] != timestamps[2]) {
+        if (timestamps[0] != timestamps[1] && timestamps[1] != timestamps[2] && timestamps[0] != timestamps[2]) {
             // All timestamps are different - raid must have at least 2 failed drives
             m_status = RAID_FAILED;
             return m_status;
         }
-        if(timestamps[0] == timestamps[1] && timestamps[1] == timestamps[2]) {
+        if (timestamps[0] == timestamps[1] && timestamps[1] == timestamps[2]) {
             // All timestamps match, set metadata
             m_metadata.m_timestamp = timestamps[0];
             m_metadata.m_failed_drive_i = failed_drives[0];
-            if(m_metadata.m_failed_drive_i == -1)
+            if (m_metadata.m_failed_drive_i == -1)
                 m_status = RAID_OK;
             else
                 m_status = RAID_DEGRADED;
-        }
-        else if(timestamps[0] == timestamps[1] && failed_drives[0] == 2) {
+        } else if (timestamps[0] == timestamps[1] && failed_drives[0] == 2) {
             // Third drive failed
             m_metadata.m_timestamp = timestamps[0];
             m_metadata.m_failed_drive_i = 2;
             m_status = RAID_DEGRADED;
-        }
-        else if(timestamps[0] == timestamps[2] && failed_drives[0] == 1) {
+        } else if (timestamps[0] == timestamps[2] && failed_drives[0] == 1) {
             // Second drive failed
             m_metadata.m_timestamp = timestamps[0];
             m_metadata.m_failed_drive_i = 1;
             m_status = RAID_DEGRADED;
-        }
-        else if(timestamps[1] == timestamps[2] && failed_drives[1] == 0) {
+        } else if (timestamps[1] == timestamps[2] && failed_drives[1] == 0) {
             // First drive failed
             m_metadata.m_timestamp = timestamps[1];
             m_metadata.m_failed_drive_i = 0;
             m_status = RAID_DEGRADED;
-        }
-        else {
+        } else {
             // Timestamp is different while OK drives say another drive is faulty
             m_status = RAID_FAILED;
             return m_status;
@@ -338,7 +334,7 @@ int CRaidVolume::stop() {
             continue;
         }
 
-        // RAID failed while stopping, rewrite metadata without chekcing
+        // RAID failed while stopping, rewrite metadata without checking
         if (m_status == RAID_DEGRADED) {
             m_status = RAID_FAILED;
             dev_i = 0;
@@ -352,6 +348,28 @@ int CRaidVolume::stop() {
 }
 
 int CRaidVolume::resync() {
+    if (m_status == RAID_OK || m_status == RAID_FAILED || m_status == RAID_STOPPED)
+        return m_status;
+
+    for (int sector_i = 0; sector_i < (m_dev->m_Sectors - 1); sector_i++) {
+        INT_SECTOR_BUFFER(restore_buffer);
+
+        // Get original drive data from parity
+        if (xor_read_without_sector(restore_buffer, m_metadata.m_failed_drive_i, sector_i) >= 0) {
+            // One of other drives failed while restoring data
+            m_status = RAID_FAILED;
+            return m_status;
+        }
+
+        // Try write data to the possibly OK degraded drive
+        if (m_dev->m_Write(m_metadata.m_failed_drive_i, sector_i, restore_buffer, 1) != 1) {
+            m_status = RAID_DEGRADED;
+            return m_status;
+        }
+    }
+
+    m_metadata.m_failed_drive_i = -1;
+    m_status = RAID_OK;
     return m_status;
 }
 
@@ -381,7 +399,7 @@ bool CRaidVolume::read(int secNr, void *data, int secCnt) {
 
         // Try read data from "FAIL" drive - use parity
         if (m_status == RAID_DEGRADED && m_metadata.m_failed_drive_i == drive_i) {
-            if (!xor_read_without_dead_sector(static_cast<int *>(data), drive_i, drive_sector_i)) {
+            if (xor_read_without_sector(static_cast<int *>(data), drive_i, drive_sector_i) >= 0) {
                 // Reading using parity failed, 2+ drives failed, raid failed
                 m_status = RAID_FAILED;
                 return false;
@@ -437,8 +455,8 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
             // Calculate new parity sector of another "OK" drive
             INT_SECTOR_BUFFER(new_parity_buffer) = {};
 
-            if (!xor_get_parity_supplement_dead_sector(new_parity_buffer, parity_drive_i, drive_i,
-                                                       static_cast<const int *>(data), sector_i)) {
+            if (xor_get_parity_supplement_dead_sector(new_parity_buffer, parity_drive_i, drive_i,
+                                                       static_cast<const int *>(data), sector_i) >= 0) {
                 // Calculating new parity failed, 2+ drives failed, raid failed
                 m_status = RAID_FAILED;
                 return false;
@@ -466,15 +484,22 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
             else {
                 // Calculate data on dead drive before changing parity
                 INT_SECTOR_BUFFER(dead_drive_data) = {};
-                if (!xor_read_without_dead_sector(dead_drive_data, m_metadata.m_failed_drive_i, sector_i)) {
+                if (xor_read_without_sector(dead_drive_data, m_metadata.m_failed_drive_i, sector_i) >= 0) {
+                    m_status = RAID_FAILED;
+                    return false;
+                }
+
+                // Write new data to OK sector
+                if (m_dev->m_Write(drive_i, sector_i, data, 1) != 1) {
+                    // Current drive failed in addition to other degraded drive
                     m_status = RAID_FAILED;
                     return false;
                 }
 
                 // Calculate new parity sector of another "OK" drive
                 INT_SECTOR_BUFFER(new_parity_buffer) = {};
-                if (!xor_get_parity_supplement_dead_sector(new_parity_buffer, parity_drive_i,
-                                                           m_metadata.m_failed_drive_i, dead_drive_data, sector_i)) {
+                if (xor_get_parity_supplement_dead_sector(new_parity_buffer, parity_drive_i,
+                                                           m_metadata.m_failed_drive_i, dead_drive_data, sector_i) >= 0) {
                     // Calculating new parity failed, 2+ drives failed, raid failed
                     m_status = RAID_FAILED;
                     return false;
@@ -489,15 +514,39 @@ bool CRaidVolume::write(int secNr, const void *data, int secCnt) {
             }
         }
 
-        // RAID must be RAID_OK, write
-        else if (m_dev->m_Write(drive_i, sector_i, data, 1) != 1) {
-            // Current drive failed, set raid to degraded state
-            m_status = RAID_DEGRADED;
-            m_metadata.m_failed_drive_i = drive_i;
+        // RAID must be RAID_OK, write new data and then write new parity
+        else if (m_status == RAID_OK) {
+            if (m_dev->m_Write(drive_i, sector_i, data, 1) != 1) {
+                // Data drive failed, set raid to degraded state
+                m_status = RAID_DEGRADED;
+                m_metadata.m_failed_drive_i = drive_i;
+                // Repeat write in degraded state
+                raid_i--;
+                continue;
+            }
 
-            // Repeat write in degraded state
-            raid_i--;
-            continue;
+            // Recalculate parity sector
+            INT_SECTOR_BUFFER(new_parity_buffer) = {};
+            int failed_drive = -1;
+
+            if ((failed_drive = xor_read_without_sector(new_parity_buffer, parity_drive_i, sector_i)) >= 0) {
+                // Data drive failed, set raid to degraded state
+                m_status = RAID_DEGRADED;
+                m_metadata.m_failed_drive_i = failed_drive;
+                // Repeat write in degraded state
+                raid_i--;
+                continue;
+            }
+
+            // Write recalculated parity sector
+            if (m_dev->m_Write(parity_drive_i, sector_i, new_parity_buffer, 1) != 1) {
+                // Parity drive failed, set raid to degraded state
+                m_status = RAID_DEGRADED;
+                m_metadata.m_failed_drive_i = parity_drive_i;
+                // Repeat write in degraded state
+                raid_i--;
+                continue;
+            }
         }
 
         // Increment buffer pointer
@@ -553,7 +602,7 @@ inline void CRaidVolume::xor_int_buffers(INT_SECTOR_BUFFER(out_buffer), const IN
     }
 }
 
-inline bool CRaidVolume::xor_read_without_dead_sector(
+inline int CRaidVolume::xor_read_without_sector(
     INT_SECTOR_BUFFER(out_buffer), const int dead_drive_i, const int sector_i) const {
     // Create next buffer for newly read sectors
     INT_SECTOR_BUFFER(next_buffer);
@@ -566,13 +615,13 @@ inline bool CRaidVolume::xor_read_without_dead_sector(
         if (drive_i == dead_drive_i)
             continue;
         if (m_dev->m_Read(drive_i, sector_i, next_buffer, 1) != 1)
-            return false;
+            return drive_i;
         xor_int_buffers(out_buffer, next_buffer);
     }
-    return true;
+    return -1;
 }
 
-bool CRaidVolume::xor_get_parity_supplement_dead_sector(
+inline int CRaidVolume::xor_get_parity_supplement_dead_sector(
     INT_SECTOR_BUFFER(out_buffer), const int parity_drive_i, const int dead_drive_i,
     const INT_SECTOR_BUFFER(dead_drive_supplement_buffer), const int sector_i) const {
     // Create next buffer for newly read sectors
@@ -592,10 +641,10 @@ bool CRaidVolume::xor_get_parity_supplement_dead_sector(
         }
         // Xor out buffer with newly read next buffer
         if (m_dev->m_Read(drive_i, sector_i, next_buffer, 1) != 1)
-            return false;
+            return drive_i;
         xor_int_buffers(out_buffer, next_buffer);
     }
-    return true;
+    return -1;
 }
 
 

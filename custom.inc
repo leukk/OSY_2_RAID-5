@@ -272,6 +272,8 @@ void resync_test() {
     }
 
     assert(vol.write(0, buffer.get(), SEC_COUNT));
+    assert(vol.read(0, check.get(), SEC_COUNT));
+    assert(!memcmp(buffer.get(), check.get(), BUFFER_ALLOC));
 
     assert(vol.stop() == RAID_STOPPED);
     assert(vol.status() == RAID_STOPPED);
@@ -280,6 +282,10 @@ void resync_test() {
     dev.m_Write = diskWriteBadOne;
 
     assert(vol.start(dev) == RAID_DEGRADED);
+
+    assert(vol.read(0, check.get(), SEC_COUNT));
+    assert(!memcmp(buffer.get(), check.get(), BUFFER_ALLOC));
+
     assert(vol.status() == RAID_DEGRADED);
     assert(vol.stop() == RAID_STOPPED);
     assert(vol.status() == RAID_STOPPED);
