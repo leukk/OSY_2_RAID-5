@@ -513,6 +513,11 @@ void test1() {
     for (int i = 0; i < vol.size(); i++) {
         char buffer[SECTOR_SIZE];
         memset(buffer, i % 127, sizeof(buffer));
+
+        if(i == 16383) {
+            dbg("This is where shit hits the fan");
+        }
+
         assert(vol.write(i, buffer, 1));
     }
 
@@ -527,6 +532,9 @@ void test1() {
     assert(vol.status() == RAID_OK);
 
     for (int i = 0; i < vol.size(); i++) {
+        if(i == 16383) {
+            dbg("This is where shit hits the fan");
+        }
         char buffer[SECTOR_SIZE];
         assert(vol.read(i, buffer, 1));
         for (size_t j = 0; j < sizeof(buffer); ++j) {
