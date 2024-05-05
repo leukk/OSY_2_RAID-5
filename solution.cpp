@@ -586,16 +586,12 @@ void CRaidVolume::raid_sector_to_physical(const int raid_sector, int &drive_i, i
                                           int &parity_drive_i) const {
     const int mod = m_dev->m_Devices;
 
-    const int skipped_parities = 1 + (int) (raid_sector / mod) + (raid_sector/(2 * mod));
+    const int skipped_parities = 1 + (int) (raid_sector / mod) + (raid_sector/(mod * (mod-1)));
     const int phys_sector = raid_sector + skipped_parities;
 
     drive_i = phys_sector % mod;
     drive_sector_i = phys_sector / mod;
     parity_drive_i = (phys_sector / mod) % mod;
-
-    // drive_i = raid_sector / m_dev->m_Sectors;
-    // drive_sector_i = raid_sector % m_dev->m_Sectors;
-    // parity_drive_i = m_dev->m_Devices - 1;
 }
 
 void CRaidVolume::clear_raid_volume_data() {
